@@ -16,6 +16,9 @@ DWORD PrintEvent(EVT_HANDLE hEvent);
 DWORD PrintEventSystemData(EVT_HANDLE hEvent);
 DWORD PrintEventValues(EVT_HANDLE hEvent);
 bool populateEventData(PEVT_VARIANT bufValue);
+bool eventFormatMessageTask(EVT_HANDLE publisher, EVT_HANDLE evtHandle);
+bool eventFormatMessage(EVT_HANDLE publisher, EVT_HANDLE evtHandle);
+bool detailEventData(EVT_HANDLE evtHandle, const PEVT_VARIANT pValues);
 
 struct windowsEventStruct {
 	WCHAR hostName[100];
@@ -42,29 +45,32 @@ void main(void)
 {
 	DWORD status = ERROR_SUCCESS;
 	EVT_HANDLE hSubscription = NULL;
-	LPWSTR pwsPath = L"Application";
+	LPWSTR pwsPath[] = { L"Application", L"Setup", L"Security", L"System" };
 	LPWSTR pwsQuery = L"*";
 
 	// Subscribe to events beginning with the oldest event in the channel. The subscription
 	// will return all current events in the channel and any future events that are raised
 	// while the application is active.
-	hSubscription = EvtSubscribe(NULL, NULL, pwsPath, pwsQuery, NULL, NULL,
-		(EVT_SUBSCRIBE_CALLBACK)SubscriptionCallback, EvtSubscribeStartAtOldestRecord);
-	if (NULL == hSubscription)
+	for (unsigned int i = 0; i < sizeof(pwsPath) / sizeof(pwsPath[0]); i++)
 	{
-		status = GetLastError();
+		hSubscription = EvtSubscribe(NULL, NULL, pwsPath[i], pwsQuery, NULL, NULL,
+			(EVT_SUBSCRIBE_CALLBACK)SubscriptionCallback, EvtSubscribeStartAtOldestRecord);
+		if (NULL == hSubscription)
+		{
+			status = GetLastError();
 
-		if (ERROR_EVT_CHANNEL_NOT_FOUND == status)
-			wprintf(L"Channel %s was not found.\n", pwsPath);
-		else if (ERROR_EVT_INVALID_QUERY == status)
-			// You can call EvtGetExtendedStatus to get information as to why the query is not valid.
-			wprintf(L"The query \"%s\" is not valid.\n", pwsQuery);
-		else
-			wprintf(L"EvtSubscribe failed with %lu.\n", status);
+			if (ERROR_EVT_CHANNEL_NOT_FOUND == status)
+				wprintf(L"Channel %s was not found.\n", pwsPath);
+			else if (ERROR_EVT_INVALID_QUERY == status)
+				// You can call EvtGetExtendedStatus to get information as to why the query is not valid.
+				wprintf(L"The query \"%s\" is not valid.\n", pwsQuery);
+			else
+				wprintf(L"EvtSubscribe failed with %lu.\n", status);
 
-		goto cleanup;
+			goto cleanup;
+		}
+
 	}
-
 	wprintf(L"Hit any key to quit\n\n");
 	while (!_kbhit())
 		Sleep(10);
@@ -247,7 +253,7 @@ DWORD PrintEventSystemData(EVT_HANDLE hEvent)
 	}
 	else
 	{
-		wprintf(L"Provider Guid: NULL");
+		wprintf(L"Provider Guid: NULL\n");
 	}
 
 
@@ -291,6 +297,7 @@ DWORD PrintEventSystemData(EVT_HANDLE hEvent)
 	wprintf(L"Execution ThreadID: %lu\n", pRenderedValues[EvtSystemThreadID].UInt32Val);
 	wprintf(L"Channel: %s\n", (EvtVarTypeNull == pRenderedValues[EvtSystemChannel].Type) ? L"" : pRenderedValues[EvtSystemChannel].StringVal);
 	wprintf(L"Computer: %s\n", pRenderedValues[EvtSystemComputer].StringVal);
+	
 
 	if (EvtVarTypeNull != pRenderedValues[EvtSystemUserID].Type)
 	{
@@ -301,6 +308,7 @@ DWORD PrintEventSystemData(EVT_HANDLE hEvent)
 		}
 	}
 
+	detailEventData(hEvent, pRenderedValues);
 cleanup:
 
 	if (hContext)
@@ -380,6 +388,116 @@ cleanup:
 	return status;
 }
 
+bool detailEventData(EVT_HANDLE evtHandle, const PEVT_VARIANT pValues)
+{
+	EVT_HANDLE publisher = NULL;
+	publisher = EvtOpenPublisherMetadata(NULL, pValues[EvtSystemProviderName].StringVal, NULL, NULL, 0);
+	if (publisher == NULL)
+	{
+		DWORD dwRes = GetLastError();
+		std::cout << dwRes << std::endl;
+		return false;
+	}
+	if (EvtVarTypeNull != pValues[EvtSystemTask].Type && pValues[EvtSystemTask].UInt16Val) {
+		if (eventFormatMessageTask(publisher, evtHandle) == false){
+			EvtClose(publisher);
+			return false;
+		}
+	}
+
+	if (eventFormatMessage(publisher, evtHandle) == false){
+		EvtClose(publisher);
+		return false;
+	}
+
+	// We no londer need the publisher.
+	EvtClose(publisher);
+	return true;
+}
+
+bool eventFormatMessage(EVT_HANDLE publisher, EVT_HANDLE evtHandle)
+{
+	DWORD dwBuffSize = 0;
+	DWORD dwBuffUsed = 0;
+	LPSTR eventTempString = new TCHAR[2000];
+
+	////Strings				= XML Message
+	//EvtFormatMessageEvent
+	BOOL bRet = EvtFormatMessage(publisher, evtHandle, NULL, 0, NULL, EvtFormatMessageEvent, dwBuffSize, NULL, &dwBuffUsed);
+	//only supplying system values isn't enough to populate the whole event
+	//bRet = EvtFormatMessage(mPublisher[pValues[EvtSystemProviderName].StringVal], hEvents[i], NULL, dwPropertyCount, pValues, EvtFormatMessageEvent, dwBuffSize, pBuff, &dwBuffUsed);
+	if (!bRet) {
+		DWORD dwRes = GetLastError();
+		//if (SNAREDEBUG >= 9) DebugMsg("EvtFormatMessage Error: %d", dwRes);
+		if (dwRes == ERROR_INSUFFICIENT_BUFFER) {
+			// Allocate the buffer size needed to for the XML event.
+			dwBuffSize = dwBuffUsed;
+			WCHAR *pBuff = new WCHAR[dwBuffSize];
+			if (pBuff == NULL) {
+				return false;
+			}
+			bRet = EvtFormatMessage(publisher, evtHandle, NULL, 0, NULL, EvtFormatMessageEvent, dwBuffSize, pBuff, &dwBuffUsed);
+			//only supplying system values isn't enough to populate the whole event
+			//bRet = EvtFormatMessage(publisher, hEvents[i], NULL, dwPropertyCount, pValues, EvtFormatMessageEvent, dwBuffSize, pBuff, &dwBuffUsed);
+			WideCharToMultiByte(CP_UTF8, 0, pBuff, -1, eventTempString, dwBuffSize, NULL, NULL);
+			std::cout << "Event String: " << eventTempString << std::endl;
+			delete[] pBuff;
+		}
+		else {
+			std::cout << "EvtFormatMessageEvent Error: " << dwRes << std::endl;
+			return false;
+		}
+		if (!bRet)
+		{
+			dwRes = GetLastError();
+			std::cout << "EvtFormatMessageEvent Error 2: " << dwRes << std::endl;
+			if (dwRes == ERROR_EVT_UNRESOLVED_VALUE_INSERT) {
+				std::cout << "EvtFormatMessageEvent Error 2: Unresolved value insert, ignoring" << std::endl;
+			}
+			else if (dwRes == ERROR_INSUFFICIENT_BUFFER && dwBuffSize >= dwBuffUsed) {
+				//WTF?  The buffer is the right size, but there isn't enough buffer space... mmmkay
+				// ignore the error and proceed as normal, cleanup everything else
+				std::cout << "EvtFormatMessageEvent Error 2: IGNORED, buffer looks ok" << std::endl;
+			}
+			else {
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
+
+bool eventFormatMessageTask(EVT_HANDLE publisher, EVT_HANDLE evtHandle)
+{
+	////category				= XML
+	DWORD dwBuffSize = 0;
+	DWORD dwBuffUsed = 0;
+	LPSTR eventTempString = new TCHAR[200];
+
+	BOOL bRet = EvtFormatMessage(publisher, evtHandle, NULL, 0, NULL, EvtFormatMessageTask, dwBuffSize, NULL, &dwBuffUsed);
+	if (!bRet)
+	{
+		DWORD dwRes = GetLastError();
+		if (dwRes == ERROR_INSUFFICIENT_BUFFER) {
+			// Allocate the buffer size needed to for the XML event.
+			dwBuffSize = dwBuffUsed;
+			WCHAR *pBuff = new WCHAR[dwBuffSize];
+			if (pBuff == NULL) {
+				std::cout << "Insufficent memory to obtain full event data" << std::endl;
+				return false;
+			}
+
+			bRet = EvtFormatMessage(publisher, evtHandle, NULL, 0, NULL, EvtFormatMessageTask, dwBuffSize, pBuff, &dwBuffUsed);
+			// XXX What about !bRet?
+			WideCharToMultiByte(CP_UTF8, 0, pBuff, -1, eventTempString, sizeof(eventTempString), NULL, NULL);
+			delete[] pBuff;
+		}
+	}
+
+	return true;
+
+}
 bool populateEventData(PEVT_VARIANT pValues)
 {
 	windowsEventStruct structObj;
