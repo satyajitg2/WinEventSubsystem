@@ -10,3 +10,20 @@ Curl Dependencies in Visual Studio
 libcurl.lib
 ws2_32.lib
 wldap32.lib
+
+Elastic Index Utility commands
+1. Delete index -  curl -XDELETE 'localhost:9200/event?pretty'
+2. Create index - curl -XPUT 'localhost:9200/event?pretty&pretty'
+3. Add sample Data - 
+curl -XPUT 'http://localhost:9200/event/doc/4346?pretty&pretty' -H 'Content-Type: application/json' -d'
+{"event_id":4346,"event_count":6393,"Source":"Microsoft-Windows-NlaSvc/OperationalMicrosoft-Windows-NlaSvc","username":"AUTHORITYSYSTEM","Date/Time":"Wed, 2017-Dec-20 13:36:43 UTC+10:30","System":"SSingh-HP","Strings":"LDAP authentication on interface {1F552EB7-4540-4038-8604-95C47BA6CCB3} (192.168.56.1) failed with error 0x51"}'
+
+Starting ElasticSearch
+Start in cmd 
+C:\Program Files\Elastic\Elasticsearch\6.1.1\bin\ElasticSearch.exe
+
+Run Kibana
+cd C:\local\kibana-6.1.0-windows-x86_64\kibana-6.1.0-windows-x86_64\bin\Kibana.bat
+
+Open Web UI
+http://localhost:5601/app/kibana#/home?_g=()
