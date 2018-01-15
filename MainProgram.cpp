@@ -1,24 +1,36 @@
 #include <windows.h>
 #include <conio.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <winevt.h>
 #include <iostream>
 #include <locale>
 #include <codecvt>
 #include <Sddl.h>
+#include <curl.h>
+#include <boost/property_tree/ptree.hpp>
+#include <boost/property_tree/json_parser.hpp>
+
+namespace pt = boost::property_tree;
+static int eventCount = 0;
+
+//CRITICAL_SECTION to protect curl use
+// Global variable
+CRITICAL_SECTION CriticalSection;
 
 
 #pragma comment(lib, "wevtapi.lib")
 #pragma comment(lib, "Advapi32.lib")
 
 DWORD WINAPI SubscriptionCallback(EVT_SUBSCRIBE_NOTIFY_ACTION action, PVOID pContext, EVT_HANDLE hEvent);
-DWORD PrintEvent(EVT_HANDLE hEvent);
 DWORD PrintEventSystemData(EVT_HANDLE hEvent);
-DWORD PrintEventValues(EVT_HANDLE hEvent);
-bool populateEventData(PEVT_VARIANT bufValue);
-bool eventFormatMessageTask(EVT_HANDLE publisher, EVT_HANDLE evtHandle);
-bool eventFormatMessage(EVT_HANDLE publisher, EVT_HANDLE evtHandle);
-bool detailEventData(EVT_HANDLE evtHandle, const PEVT_VARIANT pValues);
+bool eventFormatMessageTask(EVT_HANDLE publisher, EVT_HANDLE evtHandle, pt::ptree& event_ptree);
+bool eventFormatMessage(EVT_HANDLE publisher, EVT_HANDLE evtHandle, pt::ptree& event_ptree);
+bool detailEventData(EVT_HANDLE evtHandle, const PEVT_VARIANT pValues, pt::ptree& event_ptree);
+bool simpleCurlTest();
+bool sendCurlRequest(pt::ptree event_ptree);
+std::string wcharStringToString(wchar_t* buffer, PEVT_VARIANT& pRenderedValues, EVT_SYSTEM_PROPERTY_ID id);
+bool findUserFromSid(PSID sid, std::string& str);
 
 struct windowsEventStruct {
 	WCHAR hostName[100];
@@ -40,6 +52,73 @@ struct windowsEventStruct {
 	wchar_t	bookMark[200];
 };
 
+std::string wcharStringToString(wchar_t* buffer, PEVT_VARIANT& pRenderedValues, EVT_SYSTEM_PROPERTY_ID id)
+{
+	char charBuf[500];
+	swprintf(buffer, 500, L"%s", pRenderedValues[id].StringVal);
+	size_t convertedChars = 0;
+	wcstombs_s(&convertedChars, charBuf, wcslen(buffer) + 1, buffer, _TRUNCATE);
+	std::string str(charBuf);
+	return str;
+}
+
+std::string wcharIntToString(wchar_t* buffer, PEVT_VARIANT& pRenderedValues, EVT_SYSTEM_PROPERTY_ID id)
+{
+	char charBuf[500];
+	swprintf(buffer, 500, L"%I64u", pRenderedValues[id].UInt64Val);
+	size_t convertedChars = 0;
+	wcstombs_s(&convertedChars, charBuf, wcslen(buffer) + 1, buffer, _TRUNCATE);
+	std::string str(charBuf);
+	return str;
+}
+
+bool sendCurlRequest(pt::ptree event_ptree)
+{
+	CURL *curl;
+	CURLcode res;
+	// Request ownership of the critical section.
+	EnterCriticalSection(&CriticalSection);
+	curl_global_init(CURL_GLOBAL_ALL);
+	curl = curl_easy_init();
+	if (curl) {
+		std::stringstream ss;
+		pt::write_json(ss, event_ptree);
+		std::string s = ss.str();
+
+		/*First set the URL this is about to receive our POST. This URL can
+		just as well be a https:// URL if that is what should receive the data.*/
+		std::string url_init = "http://localhost:9200/event/doc/";
+		std::string urlEventCount = url_init.append(std::to_string(eventCount++));
+		std::string url = urlEventCount.append("?pretty&pretty");
+
+		struct curl_slist *headers = NULL;
+		headers = curl_slist_append(headers, "Accept: application/json");
+		headers = curl_slist_append(headers, "Content-Type: application/json");
+		headers = curl_slist_append(headers, "charsets: utf-8");
+
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+		curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+		curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+		curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
+
+		/* HTTP PUT please */
+		curl_easy_setopt(curl, CURLOPT_POST, 1L);
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, s.c_str());
+
+		/* Perform the request, res will get the return code */
+		res = curl_easy_perform(curl);
+		/* Check for errors */
+		if (res != CURLE_OK)
+			fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+		/* always cleanup */
+		curl_easy_cleanup(curl);
+	}
+	curl_global_cleanup();
+	// Release ownership of the critical section.
+	LeaveCriticalSection(&CriticalSection);
+	return 0;
+}
+
 
 void main(void)
 {
@@ -47,6 +126,10 @@ void main(void)
 	EVT_HANDLE hSubscription = NULL;
 	LPWSTR pwsPath[] = { L"Application", L"Setup", L"Security", L"System" };
 	LPWSTR pwsQuery = L"*";
+
+	// Initialize the critical section one time only.
+	if (!InitializeCriticalSectionAndSpinCount(&CriticalSection, 0x00000400))
+		return;
 
 	// Subscribe to events beginning with the oldest event in the channel. The subscription
 	// will return all current events in the channel and any future events that are raised
@@ -74,11 +157,14 @@ void main(void)
 	wprintf(L"Hit any key to quit\n\n");
 	while (!_kbhit())
 		Sleep(10);
-
+	
 cleanup:
-
+	// Release resources used by the critical section object.
+	DeleteCriticalSection(&CriticalSection);
 	if (hSubscription)
 		EvtClose(hSubscription);
+
+
 }
 
 // The callback that receives the events that match the query criteria. 
@@ -125,70 +211,7 @@ cleanup:
 
 	return status; // The service ignores the returned status.
 }
-DWORD PrintEventValues(EVT_HANDLE hEvent)
-{
-	DWORD status = ERROR_SUCCESS;
-	EVT_HANDLE hContext = NULL;
-	DWORD dwBufferSize = 0;
-	DWORD dwBufferUsed = 0;
-	DWORD dwPropertyCount = 0;
-	PEVT_VARIANT pRenderedValues = NULL;
-	LPWSTR ppValues[] = { L"Event/System/Provider/@Name", L"Event/System/Channel" };
-	DWORD count = sizeof(ppValues) / sizeof(LPWSTR);
 
-	// Identify the components of the event that you want to render. In this case,
-	// render the provider's name and channel from the system section of the event.
-	// To get user data from the event, you can specify an expression such as
-	// L"Event/EventData/Data[@Name=\"<data name goes here>\"]".
-	hContext = EvtCreateRenderContext(count, (LPCWSTR*)ppValues, EvtRenderContextValues);
-	if (NULL == hContext)
-	{
-		wprintf(L"EvtCreateRenderContext failed with %lu\n", status = GetLastError());
-		goto cleanup;
-	}
-
-	// The function returns an array of variant values for each element or attribute that
-	// you want to retrieve from the event. The values are returned in the same order as 
-	// you requested them.
-	if (!EvtRender(hContext, hEvent, EvtRenderEventValues, dwBufferSize, pRenderedValues, &dwBufferUsed, &dwPropertyCount))
-	{
-		if (ERROR_INSUFFICIENT_BUFFER == (status = GetLastError()))
-		{
-			dwBufferSize = dwBufferUsed;
-			pRenderedValues = (PEVT_VARIANT)malloc(dwBufferSize);
-			if (pRenderedValues)
-			{
-				EvtRender(hContext, hEvent, EvtRenderEventValues, dwBufferSize, pRenderedValues, &dwBufferUsed, &dwPropertyCount);
-			}
-			else
-			{
-				wprintf(L"malloc failed\n");
-				status = ERROR_OUTOFMEMORY;
-				goto cleanup;
-			}
-		}
-
-		if (ERROR_SUCCESS != (status = GetLastError()))
-		{
-			wprintf(L"EvtRender failed with %d\n", GetLastError());
-			goto cleanup;
-		}
-	}
-
-	// Print the selected values.
-	wprintf(L"\nProvider Name: %s\n", pRenderedValues[0].StringVal);
-	wprintf(L"Channel: %s\n", (EvtVarTypeNull == pRenderedValues[1].Type) ? L"" : pRenderedValues[1].StringVal);
-
-cleanup:
-
-	if (hContext)
-		EvtClose(hContext);
-
-	if (pRenderedValues)
-		free(pRenderedValues);
-
-	return status;
-}
 DWORD PrintEventSystemData(EVT_HANDLE hEvent)
 {
 	DWORD status = ERROR_SUCCESS;
@@ -203,6 +226,10 @@ DWORD PrintEventSystemData(EVT_HANDLE hEvent)
 	ULONGLONG ullNanoseconds = 0;
 	SYSTEMTIME st;
 	FILETIME ft;
+	std::string str;
+	pt::ptree event_ptree;
+	wchar_t buffer[500];
+
 
 	// Identify the components of the event that you want to render. In this case,
 	// render the system section of the event.
@@ -243,9 +270,23 @@ DWORD PrintEventSystemData(EVT_HANDLE hEvent)
 			goto cleanup;
 		}
 	}
+	DWORD EventID = pRenderedValues[EvtSystemEventID].UInt16Val;
+	if (EvtVarTypeNull != pRenderedValues[EvtSystemQualifiers].Type)
+	{
+		EventID = MAKELONG(pRenderedValues[EvtSystemEventID].UInt16Val, pRenderedValues[EvtSystemQualifiers].UInt16Val);
+	}
+	wprintf(L"EventID: %lu\n", EventID);
+	swprintf(buffer, 500, L"%lu", EventID);
+	char buf[500];
+	size_t convertedChars = 0;
+	wcstombs_s(&convertedChars, buf, wcslen(buffer) + 1, buffer, _TRUNCATE);
+	event_ptree.put("EventID", buf);
 
 	// Print the values from the System section of the element.
 	wprintf(L"Provider Name: %s\n", pRenderedValues[EvtSystemProviderName].StringVal);
+	swprintf(buffer, 100, L"%s", pRenderedValues[EvtSystemProviderName].StringVal);
+	event_ptree.put("Source", wcharStringToString(buffer, pRenderedValues, EvtSystemProviderName).c_str());
+
 	if (NULL != pRenderedValues[EvtSystemProviderGuid].GuidVal)
 	{
 		StringFromGUID2(*(pRenderedValues[EvtSystemProviderGuid].GuidVal), wsGuid, sizeof(wsGuid) / sizeof(WCHAR));
@@ -256,13 +297,6 @@ DWORD PrintEventSystemData(EVT_HANDLE hEvent)
 		wprintf(L"Provider Guid: NULL\n");
 	}
 
-
-	DWORD EventID = pRenderedValues[EvtSystemEventID].UInt16Val;
-	if (EvtVarTypeNull != pRenderedValues[EvtSystemQualifiers].Type)
-	{
-		EventID = MAKELONG(pRenderedValues[EvtSystemEventID].UInt16Val, pRenderedValues[EvtSystemQualifiers].UInt16Val);
-	}
-	wprintf(L"EventID: %lu\n", EventID);
 
 	wprintf(L"Version: %u\n", (EvtVarTypeNull == pRenderedValues[EvtSystemVersion].Type) ? 0 : pRenderedValues[EvtSystemVersion].ByteVal);
 	wprintf(L"Level: %u\n", (EvtVarTypeNull == pRenderedValues[EvtSystemLevel].Type) ? 0 : pRenderedValues[EvtSystemLevel].ByteVal);
@@ -279,7 +313,20 @@ DWORD PrintEventSystemData(EVT_HANDLE hEvent)
 	wprintf(L"TimeCreated SystemTime: %02d/%02d/%02d %02d:%02d:%02d.%I64u)\n",
 		st.wMonth, st.wDay, st.wYear, st.wHour, st.wMinute, st.wSecond, ullNanoseconds);
 
+	swprintf(buffer, 500, L"TimeCreated SystemTime: %02d/%02d/%02d %02d:%02d:%02d.%I64u)",
+		st.wMonth, st.wDay, st.wYear, st.wHour, st.wMinute, st.wSecond, ullNanoseconds);
+
+	char dateBuf[500];
+	convertedChars = 0;
+	wcstombs_s(&convertedChars, dateBuf, wcslen(buffer) + 1, buffer, _TRUNCATE);
+	event_ptree.put("Date/Time", dateBuf);
+
+
 	wprintf(L"EventRecordID: %I64u\n", pRenderedValues[EvtSystemEventRecordId].UInt64Val);
+	event_ptree.put("EventID", wcharIntToString(buffer, pRenderedValues, EvtSystemEventRecordId).c_str());
+
+	event_ptree.put("System", wcharStringToString(buffer, pRenderedValues, EvtSystemComputer));
+	event_ptree.put("Channel", wcharStringToString(buffer, pRenderedValues, EvtSystemChannel));
 
 	if (EvtVarTypeNull != pRenderedValues[EvtSystemActivityID].Type)
 	{
@@ -297,18 +344,31 @@ DWORD PrintEventSystemData(EVT_HANDLE hEvent)
 	wprintf(L"Execution ThreadID: %lu\n", pRenderedValues[EvtSystemThreadID].UInt32Val);
 	wprintf(L"Channel: %s\n", (EvtVarTypeNull == pRenderedValues[EvtSystemChannel].Type) ? L"" : pRenderedValues[EvtSystemChannel].StringVal);
 	wprintf(L"Computer: %s\n", pRenderedValues[EvtSystemComputer].StringVal);
-	
+
 
 	if (EvtVarTypeNull != pRenderedValues[EvtSystemUserID].Type)
 	{
+		char ch[5000];
+		char DefChar = ' ';
 		if (ConvertSidToStringSid(pRenderedValues[EvtSystemUserID].SidVal, &pwsSid))
 		{
+			//PROBLEM STRING *********************************
 			wprintf(L"Security UserID: %s\n", pwsSid);
+			wprintf(L"Security UserID: %s\n", pRenderedValues[EvtSystemUserID].SidVal);
+			char charBuf[100];
+			swprintf(buffer, 100, L"%s", pwsSid);
+
+			size_t convertedChars = 0;
+			//WideCharToMultiByte(CP_ACP, 0, pwsSid, -1, ch, 5000, &DefChar, NULL);
+			//_snprintf_s(&DefChar, sizeof(&DefChar), _TRUNCATE, "%s", pwsSid);
+			std::string uName;
+			findUserFromSid(pRenderedValues[EvtSystemUserID].SidVal, uName);
+			event_ptree.put("UserID", uName.c_str());
 			LocalFree(pwsSid);
 		}
 	}
 
-	detailEventData(hEvent, pRenderedValues);
+	detailEventData(hEvent, pRenderedValues, event_ptree);
 cleanup:
 
 	if (hContext)
@@ -320,76 +380,46 @@ cleanup:
 	return status;
 }
 
-
-// Render the event as an XML string and print it.
-DWORD PrintEvent(EVT_HANDLE hEvent)
+bool findUserFromSid(PSID sid, std::string& str)
 {
-	DWORD status = ERROR_SUCCESS;
-	DWORD dwBufferSize = 0;
-	DWORD dwBufferUsed = 0;
-	DWORD dwPropertyCount = 0;
-	LPWSTR pRenderedContent = NULL;
-
-	PEVT_VARIANT bufValue = NULL;
-	/*
-	BOOL bRet = ProcEvtRender(
-	renderContext,		// Session.
-	evtHandle,			// HANDLE.
-	EvtRenderEventValues,	// Flags.
-	dwValueSize,		// BufferSize.
-	NULL,			// Send NULL to get buffersize needed
-	&dwValueSize,		// Buffersize that is used or required.
-	&dwPropertyCount);
-
-
-	*/
-	EVT_HANDLE renderContext;
-
-	renderContext = EvtCreateRenderContext(0, NULL, EvtRenderContextSystem);
-	//if (!EvtRender(renderContext, hEvent, EvtRenderEventValues, dwBufferSize, NULL, &dwBufferUsed, &dwPropertyCount))
-	if (!EvtRender(NULL, hEvent, EvtRenderEventXml, dwBufferSize, pRenderedContent, &dwBufferUsed, &dwPropertyCount))
-	{
-		if (ERROR_INSUFFICIENT_BUFFER == (status = GetLastError()))
-		{
-			dwBufferSize = dwBufferUsed;
-			pRenderedContent = (LPWSTR)malloc(dwBufferSize);
-			bufValue = new EVT_VARIANT[dwBufferSize];
-
-
-			//pValues = new EVT_VARIANT[dwBufferUsed];
-			if (pRenderedContent)
-			{
-				EvtRender(NULL, hEvent, EvtRenderEventXml, dwBufferSize, pRenderedContent, &dwBufferUsed, &dwPropertyCount);
-				//EvtRender(renderContext, hEvent, EvtRenderEventValues, dwBufferSize, bufValue, &dwBufferUsed, &dwPropertyCount);
-			}
-			else
-			{
-				wprintf(L"malloc failed\n");
-				status = ERROR_OUTOFMEMORY;
-				goto cleanup;
+	char userName[256];
+	try {
+		if (IsValidSid(sid)) {
+			char szName[257] = "";
+			char szDomain[257] = "";
+			DWORD cbName = 256;
+			DWORD cbDomain = 256;
+			SID_NAME_USE snu;
+			DWORD dwRC = LookupAccountSid(NULL, sid, szName, &cbName, szDomain, &cbDomain, &snu);
+			if (strlen(szName)) {
+				if (strlen(szDomain)) {
+					_snprintf_s(userName, 256, _TRUNCATE, "%s\\%s", szDomain, szName);
+				}
+				else {
+					_snprintf_s(userName, 256, _TRUNCATE, "%s", szName);
+				}
 			}
 		}
-
-		if (ERROR_SUCCESS != (status = GetLastError()))
-		{
-			wprintf(L"EvtRender failed with %d\n", status);
-			goto cleanup;
+		else {
+			return false;
 		}
 	}
+	catch (...) {
 
-	wprintf(L"%s\n\n", pRenderedContent);
-	//populateEventData(bufValue);
+		LPSTR psSid = NULL;
 
-cleanup:
-
-	if (pRenderedContent)
-		free(pRenderedContent);
-
-	return status;
+		if (ConvertSidToStringSid(sid, &psSid)) {
+			strncpy_s(userName, 256, psSid, _TRUNCATE);
+			LocalFree(psSid);
+		}
+	}
+	str.assign(userName);
+	return true;
 }
 
-bool detailEventData(EVT_HANDLE evtHandle, const PEVT_VARIANT pValues)
+bool detailEventData(EVT_HANDLE evtHandle, const PEVT_VARIANT pValues, pt::ptree& event_ptree)
 {
+	pt::ptree eventPtree;
 	EVT_HANDLE publisher = NULL;
 	publisher = EvtOpenPublisherMetadata(NULL, pValues[EvtSystemProviderName].StringVal, NULL, NULL, 0);
 	if (publisher == NULL)
@@ -399,36 +429,35 @@ bool detailEventData(EVT_HANDLE evtHandle, const PEVT_VARIANT pValues)
 		return false;
 	}
 	if (EvtVarTypeNull != pValues[EvtSystemTask].Type && pValues[EvtSystemTask].UInt16Val) {
-		if (eventFormatMessageTask(publisher, evtHandle) == false){
+		if (eventFormatMessageTask(publisher, evtHandle, event_ptree) == false){
 			EvtClose(publisher);
 			return false;
 		}
 	}
 
-	if (eventFormatMessage(publisher, evtHandle) == false){
+	if (eventFormatMessage(publisher, evtHandle, event_ptree) == false){
 		EvtClose(publisher);
 		return false;
 	}
 
+	pt::ptree curlPtree = event_ptree;
+	sendCurlRequest(curlPtree);
 	// We no londer need the publisher.
 	EvtClose(publisher);
 	return true;
 }
 
-bool eventFormatMessage(EVT_HANDLE publisher, EVT_HANDLE evtHandle)
+bool eventFormatMessage(EVT_HANDLE publisher, EVT_HANDLE evtHandle, pt::ptree& event_ptree)
 {
 	DWORD dwBuffSize = 0;
 	DWORD dwBuffUsed = 0;
-	LPSTR eventTempString = new TCHAR[2000];
+	char ch[5000];
+	char DefChar = ' ';
 
-	////Strings				= XML Message
-	//EvtFormatMessageEvent
 	BOOL bRet = EvtFormatMessage(publisher, evtHandle, NULL, 0, NULL, EvtFormatMessageEvent, dwBuffSize, NULL, &dwBuffUsed);
 	//only supplying system values isn't enough to populate the whole event
-	//bRet = EvtFormatMessage(mPublisher[pValues[EvtSystemProviderName].StringVal], hEvents[i], NULL, dwPropertyCount, pValues, EvtFormatMessageEvent, dwBuffSize, pBuff, &dwBuffUsed);
 	if (!bRet) {
 		DWORD dwRes = GetLastError();
-		//if (SNAREDEBUG >= 9) DebugMsg("EvtFormatMessage Error: %d", dwRes);
 		if (dwRes == ERROR_INSUFFICIENT_BUFFER) {
 			// Allocate the buffer size needed to for the XML event.
 			dwBuffSize = dwBuffUsed;
@@ -438,9 +467,13 @@ bool eventFormatMessage(EVT_HANDLE publisher, EVT_HANDLE evtHandle)
 			}
 			bRet = EvtFormatMessage(publisher, evtHandle, NULL, 0, NULL, EvtFormatMessageEvent, dwBuffSize, pBuff, &dwBuffUsed);
 			//only supplying system values isn't enough to populate the whole event
-			//bRet = EvtFormatMessage(publisher, hEvents[i], NULL, dwPropertyCount, pValues, EvtFormatMessageEvent, dwBuffSize, pBuff, &dwBuffUsed);
-			WideCharToMultiByte(CP_UTF8, 0, pBuff, -1, eventTempString, dwBuffSize, NULL, NULL);
-			std::cout << "Event String: " << eventTempString << std::endl;
+			//PROBLEM conversion**************************
+
+			WideCharToMultiByte(CP_ACP, 0, pBuff, -1, ch, 5000, &DefChar, NULL);
+
+			std::string str(ch);
+			event_ptree.put("String", str.c_str());
+
 			delete[] pBuff;
 		}
 		else {
@@ -468,12 +501,12 @@ bool eventFormatMessage(EVT_HANDLE publisher, EVT_HANDLE evtHandle)
 	return true;
 }
 
-bool eventFormatMessageTask(EVT_HANDLE publisher, EVT_HANDLE evtHandle)
+bool eventFormatMessageTask(EVT_HANDLE publisher, EVT_HANDLE evtHandle, pt::ptree& event_ptree)
 {
 	////category				= XML
 	DWORD dwBuffSize = 0;
 	DWORD dwBuffUsed = 0;
-	LPSTR eventTempString = new TCHAR[200];
+	TCHAR* eventTempString = new TCHAR[200];
 
 	BOOL bRet = EvtFormatMessage(publisher, evtHandle, NULL, 0, NULL, EvtFormatMessageTask, dwBuffSize, NULL, &dwBuffUsed);
 	if (!bRet)
@@ -497,56 +530,4 @@ bool eventFormatMessageTask(EVT_HANDLE publisher, EVT_HANDLE evtHandle)
 
 	return true;
 
-}
-bool populateEventData(PEVT_VARIANT pValues)
-{
-	windowsEventStruct structObj;
-	windowsEventStruct *eventPtr = &structObj;
-	memset(eventPtr, 0, sizeof(windowsEventStruct));
-	/*
-	std::cout << pValues[EvtSystemChannel].StringVal;
-	std::cout << pValues[EvtSystemProviderName].StringVal;
-	std::cout << pValues[EvtSystemKeywords].UInt64Val;
-	std::cout << pValues[EvtSystemLevel].ByteVal;
-	std::cout << pValues[EvtSystemTimeCreated].FileTimeVal;
-	std::cout << pValues[EvtSystemUserID].SidVal;
-	std::cout << pValues[EvtSystemComputer].StringVal;
-
-	std::cout << pValues[EvtSystemProviderName].StringVal;
-	std::cout << pValues[EvtSystemTask].UInt16Val << std::endl;
-	*/
-	
-	eventPtr->shortEventId = pValues[EvtSystemEventID].UInt16Val;
-	if (pValues[EvtSystemChannel].StringVal)
-	{
-		wcsncpy_s(eventPtr->eventLogSourceName, sizeof(eventPtr->eventLogSourceName), pValues[EvtSystemChannel].StringVal, _TRUNCATE);
-	}
-	std::string strSourceName;
-	typedef std::codecvt_utf8<wchar_t> convert_typeX;
-	std::wstring_convert<convert_typeX, wchar_t> converterX;
-	try {
-		strSourceName = converterX.to_bytes(pValues[EvtSystemProviderName].StringVal);
-		std::cout << strSourceName << std::endl;
-		if (strSourceName.empty()) {
-			throw std::range_error("EvtSystemProviderName converted to empty string");
-		}
-		strncpy_s(eventPtr->sourceName, sizeof(eventPtr->sourceName), strSourceName.c_str(), _TRUNCATE);
-	}
-	catch (const std::range_error &e) {
-		LPCWSTR val = pValues[EvtSystemProviderName].StringVal;
-		while (*val) {
-			val++;
-		}
-		val = pValues[EvtSystemProviderName].StringVal;
-		strncpy_s(eventPtr->sourceName, sizeof(eventPtr->sourceName), "", _TRUNCATE);
-		while (*val) {
-			_snprintf_s(eventPtr->sourceName, sizeof(eventPtr->sourceName), _TRUNCATE, "%s%x ", eventPtr->sourceName, *val); 
-			val++;
-		}
-
-	}
-	wprintf(L"%s ", eventPtr->sourceName);
-	wprintf(L"%s \n\n",  eventPtr->eventLogSourceName);
-	
-	return true;
 }
