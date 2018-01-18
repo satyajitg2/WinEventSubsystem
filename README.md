@@ -27,3 +27,7 @@ cd C:\local\kibana-6.1.0-windows-x86_64\kibana-6.1.0-windows-x86_64\bin\Kibana.b
 
 Open Web UI
 http://localhost:5601/app/kibana#/home?_g=()
+
+1. In Management console - Create Index Pattern define Index as event* and do not forget to select @timestamp field as timefilter field.
+2. In Discover - Select event* and select time period as "Last 5 years" depending on the windows events created.
+3. You should see a page that looks like file attached in ElasticKibanaUI.jpeg
